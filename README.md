@@ -1,3 +1,5 @@
+<img width="1024" height="1024" alt="Gemini_Generated_Image_yl26v2yl26v2yl26" src="https://github.com/user-attachments/assets/223ccb55-75ee-436a-9818-dbc5af89d336" />
+
 SQL Mastery: The Journey from Data to Story
 "I don't just write queries; I translate raw data into the insights that drive real-world decisions."
 
