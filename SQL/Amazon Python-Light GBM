@@ -1,0 +1,1319 @@
+# ======================
+# AMAZON SALES PREDICTION FOR NEXT 6 MONTHS
+# ======================
+
+import pandas as pd
+import numpy as np
+from lightgbm import LGBMRegressor
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_absolute_error, r2_score
+import matplotlib.pyplot as plt
+import seaborn as sns
+from datetime import datetime, timedelta
+
+# ---------- LOAD FILES ----------
+category = pd.read_csv('category.csv')
+inventory = pd.read_csv('inventory.csv')
+customers = pd.read_csv('customers.csv')
+order_items = pd.read_csv('order_items.csv')
+orders = pd.read_csv('orders.csv')
+payments = pd.read_csv('payments.csv')
+products = pd.read_csv('products.csv')
+sellers = pd.read_csv('sellers.csv')
+shipping = pd.read_csv('shipping.csv')
+
+# ---------- DATA PREPARATION ----------
+# Merge datasets
+df = pd.merge(order_items, orders, on='order_id', how='left')
+df = pd.merge(df, products, on='product_id', how='left')
+df = pd.merge(df, category, on='category_id', how='left')
+df = pd.merge(df, customers, left_on='customer_id', right_on='Customer ID', how='left')
+df = pd.merge(df, sellers, on='seller_id', how='left')
+df = pd.merge(df, payments, on='order_id', how='left')
+
+# Create target variable
+df['total_sales'] = df['quantity'] * df['price_per_unit']
+
+# Convert date columns
+df['order_date'] = pd.to_datetime(df['order_date'])
+
+# ---------- TIME SERIES AGGREGATION ----------
+# Aggregate sales by month
+monthly_sales = df.groupby(pd.Grouper(key='order_date', freq='M')).agg({
+    'total_sales': 'sum',
+    'quantity': 'sum',
+    'order_id': 'nunique',  # Number of orders
+    'customer_id': 'nunique'  # Number of unique customers
+}).reset_index()
+
+monthly_sales.columns = ['date', 'monthly_sales', 'total_quantity', 'total_orders', 'unique_customers']
+monthly_sales = monthly_sales.sort_values('date')
+
+# ---------- FEATURE ENGINEERING FOR TIME SERIES ----------
+# Create time-based features
+monthly_sales['year'] = monthly_sales['date'].dt.year
+monthly_sales['month'] = monthly_sales['date'].dt.month
+monthly_sales['quarter'] = monthly_sales['date'].dt.quarter
+
+# Create lag features
+for lag in [1, 2, 3, 6, 12]:
+    monthly_sales[f'sales_lag_{lag}'] = monthly_sales['monthly_sales'].shift(lag)
+    monthly_sales[f'orders_lag_{lag}'] = monthly_sales['total_orders'].shift(lag)
+
+# Create rolling statistics
+monthly_sales['sales_rolling_mean_3'] = monthly_sales['monthly_sales'].rolling(window=3).mean()
+monthly_sales['sales_rolling_std_3'] = monthly_sales['monthly_sales'].rolling(window=3).std()
+monthly_sales['sales_rolling_mean_6'] = monthly_sales['monthly_sales'].rolling(window=6).mean()
+
+# Growth rates
+monthly_sales['sales_growth_rate'] = monthly_sales['monthly_sales'].pct_change()
+monthly_sales['orders_growth_rate'] = monthly_sales['total_orders'].pct_change()
+
+# Seasonality features
+monthly_sales['is_holiday_season'] = monthly_sales['month'].isin([11, 12]).astype(int)  # Nov-Dec
+monthly_sales['is_year_start'] = monthly_sales['month'].isin([1, 2]).astype(int)  # Jan-Feb
+
+# Drop rows with NaN values from lag features
+monthly_sales = monthly_sales.dropna()
+
+# ---------- PREPARE DATA FOR FORECASTING ----------
+# Define features and target
+features = [col for col in monthly_sales.columns if col not in ['date', 'monthly_sales']]
+X = monthly_sales[features]
+y = monthly_sales['monthly_sales']
+
+# Split data (use last 20% for testing)
+split_index = int(len(monthly_sales) * 0.8)
+X_train, X_test = X[:split_index], X[split_index:]
+y_train, y_test = y[:split_index], y[split_index:]
+
+# ---------- TIME SERIES MODEL TRAINING ----------
+ts_model = LGBMRegressor(
+    n_estimators=1000,
+    learning_rate=0.05,
+    max_depth=6,
+    random_state=42,
+    subsample=0.8,
+    colsample_bytree=0.8
+)
+
+ts_model.fit(X_train, y_train)
+
+# ---------- MODEL EVALUATION ----------
+y_pred = ts_model.predict(X_test)
+mae = mean_absolute_error(y_test, y_pred)
+r2 = r2_score(y_test, y_pred)
+
+print("Time Series Model Performance:")
+print(f"MAE: {mae:.2f}")
+print(f"R²: {r2:.2f}")
+
+# ---------- FORECAST NEXT 6 MONTHS ----------
+def forecast_future_months(model, last_known_data, features, n_months=6):
+    """
+    Forecast sales for next n months using recursive forecasting
+    """
+    future_predictions = []
+    current_data = last_known_data.copy()
+    
+    for month in range(n_months):
+        # Make prediction for next month
+        next_pred = model.predict(current_data[features].values.reshape(1, -1))[0]
+        future_predictions.append(next_pred)
+        
+        # Update features for next prediction
+        # Shift lag features
+        for lag in [3, 2, 1]:
+            if f'sales_lag_{lag}' in features:
+                current_data[f'sales_lag_{lag+1}'] = current_data[f'sales_lag_{lag}']
+        
+        # Update current sales as lag 1
+        current_data['sales_lag_1'] = next_pred
+        
+        # Update rolling statistics (simplified approach)
+        if 'sales_rolling_mean_3' in features:
+            # This is a simplified update - in practice you'd want more sophisticated handling
+            current_data['sales_rolling_mean_3'] = (
+                current_data['sales_lag_1'] + current_data['sales_lag_2'] + current_data['sales_lag_3']
+            ) / 3
+        
+        # Update month and year
+        current_month = current_data['month'].iloc[0]
+        current_year = current_data['year'].iloc[0]
+        
+        next_month = current_month + 1
+        next_year = current_year
+        
+        if next_month > 12:
+            next_month = 1
+            next_year = current_year + 1
+        
+        current_data['month'] = next_month
+        current_data['year'] = next_year
+        current_data['quarter'] = (next_month - 1) // 3 + 1
+        current_data['is_holiday_season'] = 1 if next_month in [11, 12] else 0
+        current_data['is_year_start'] = 1 if next_month in [1, 2] else 0
+    
+    return future_predictions
+
+# Get the most recent data point
+last_known_data = monthly_sales.iloc[-1:].copy()
+
+# Generate forecasts
+future_sales = forecast_future_months(ts_model, last_known_data, features, 6)
+
+# ---------- CREATE FUTURE DATES ----------
+last_date = monthly_sales['date'].iloc[-1]
+future_dates = [last_date + timedelta(days=30*i) for i in range(1, 7)]
+
+# Create forecast dataframe
+forecast_df = pd.DataFrame({
+    'date': future_dates,
+    'predicted_sales': future_sales,
+    'type': 'forecast'
+})
+
+# Prepare historical data for plotting
+historical_df = monthly_sales[['date', 'monthly_sales']].copy()
+historical_df['type'] = 'historical'
+historical_df = historical_df.rename(columns={'monthly_sales': 'predicted_sales'})
+
+# Combine historical and forecast data
+combined_df = pd.concat([historical_df, forecast_df], ignore_index=True)
+
+# ---------- VISUALIZE FORECAST ----------
+plt.figure(figsize=(14, 8))
+
+# Plot historical data
+historical_data = combined_df[combined_df['type'] == 'historical']
+forecast_data = combined_df[combined_df['type'] == 'forecast']
+
+plt.plot(historical_data['date'], historical_data['predicted_sales'], 
+         label='Historical Sales', color='blue', linewidth=2, marker='o')
+
+plt.plot(forecast_data['date'], forecast_data['predicted_sales'], 
+         label='Forecasted Sales', color='red', linewidth=2, linestyle='--', marker='s')
+
+plt.fill_between(forecast_data['date'], 
+                 forecast_data['predicted_sales'] * 0.8,  # Lower bound (20% less)
+                 forecast_data['predicted_sales'] * 1.2,  # Upper bound (20% more)
+                 alpha=0.3, color='red', label='Confidence Interval')
+
+plt.title('Amazon Sales Forecast - Next 6 Months', fontsize=16, fontweight='bold')
+plt.xlabel('Date', fontsize=12)
+plt.ylabel('Sales Amount', fontsize=12)
+plt.legend()
+plt.grid(True, alpha=0.3)
+plt.xticks(rotation=45)
+plt.tight_layout()
+plt.show()
+
+# ---------- DISPLAY FORECAST RESULTS ----------
+print("\n" + "="*50)
+print("SALES FORECAST FOR NEXT 6 MONTHS")
+print("="*50)
+
+forecast_details = pd.DataFrame({
+    'Month': [date.strftime('%B %Y') for date in future_dates],
+    'Predicted Sales': [f"${sales:,.2f}" for sales in future_sales],
+    'Growth Trend': ['↑' if i == 0 or future_sales[i] > future_sales[i-1] else '↓' 
+                    for i in range(len(future_sales))]
+})
+
+print(forecast_details.to_string(index=False))
+
+# Calculate summary statistics
+total_forecast_sales = sum(future_sales)
+avg_monthly_forecast = np.mean(future_sales)
+growth_rate = ((future_sales[-1] - future_sales[0]) / future_sales[0]) * 100
+
+print(f"\nForecast Summary:")
+print(f"Total Predicted Sales (6 months): ${total_forecast_sales:,.2f}")
+print(f"Average Monthly Sales: ${avg_monthly_forecast:,.2f}")
+print(f"6-Month Growth Rate: {growth_rate:+.2f}%")
+
+# ---------- SEASONAL ANALYSIS ----------
+print("\n" + "="*50)
+print("SEASONAL ANALYSIS")
+print("="*50)
+
+# Analyze seasonal patterns
+monthly_avg = monthly_sales.groupby('month')['monthly_sales'].mean()
+best_month = monthly_avg.idxmax()
+worst_month = monthly_avg.idxmin()
+
+month_names = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
+               'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+print(f"Strongest Month: {month_names[best_month-1]} (${monthly_avg[best_month]:,.2f})")
+print(f"Weakest Month: {month_names[worst_month-1]} (${monthly_avg[worst_month]:,.2f})")
+
+# ---------- FEATURE IMPORTANCE FOR TIME SERIES ----------
+feature_imp = pd.DataFrame({
+    'Feature': features,
+    'Importance': ts_model.feature_importances_
+})
+feature_imp = feature_imp.sort_values('Importance', ascending=False)
+
+plt.figure(figsize=(12, 6))
+sns.barplot(data=feature_imp.head(10), x='Importance', y='Feature')
+plt.title('Top 10 Important Features for Sales Forecasting')
+plt.tight_layout()
+plt.show()
+
+# ---------- SAVE FORECAST RESULTS ----------
+forecast_output = pd.DataFrame({
+    'date': future_dates,
+    'predicted_sales': future_sales,
+    'confidence_lower': [sales * 0.8 for sales in future_sales],
+    'confidence_upper': [sales * 1.2 for sales in future_sales]
+})
+
+forecast_output.to_csv('amazon_sales_forecast_next_6_months.csv', index=False)
+print(f"\nForecast results saved to 'amazon_sales_forecast_next_6_months.csv'")
+C:\Users\admin\AppData\Local\Temp\ipykernel_11856\961671287.py:42: FutureWarning: 'M' is deprecated and will be removed in a future version, please use 'ME' instead.
+  monthly_sales = df.groupby(pd.Grouper(key='order_date', freq='M')).agg({
+[LightGBM] [Warning] There are no meaningful features which satisfy the provided configuration. Decreasing Dataset parameters min_data_in_bin or min_data_in_leaf and re-constructing Dataset might resolve this warning.
+[LightGBM] [Info] Total Bins 0
+[LightGBM] [Info] Number of data points in the train set: 34, number of used features: 0
+[LightGBM] [Info] Start training from score 276058.781710
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+[LightGBM] [Warning] Stopped training because there are no more leaves that meet the split requirements
+Time Series Model Performance:
+MAE: 184697.32
+R²: -4.10
+C:\Users\admin\anaconda3\Lib\site-packages\sklearn\utils\validation.py:2739: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+  warnings.warn(
+C:\Users\admin\anaconda3\Lib\site-packages\sklearn\utils\validation.py:2739: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+  warnings.warn(
+C:\Users\admin\anaconda3\Lib\site-packages\sklearn\utils\validation.py:2739: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+  warnings.warn(
+C:\Users\admin\anaconda3\Lib\site-packages\sklearn\utils\validation.py:2739: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+  warnings.warn(
+C:\Users\admin\anaconda3\Lib\site-packages\sklearn\utils\validation.py:2739: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+  warnings.warn(
+C:\Users\admin\anaconda3\Lib\site-packages\sklearn\utils\validation.py:2739: UserWarning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+  warnings.warn(
+No description has been provided for this image
+==================================================
+SALES FORECAST FOR NEXT 6 MONTHS
+==================================================
+         Month Predicted Sales Growth Trend
+   August 2024     $276,058.78            ↑
+September 2024     $276,058.78            ↓
+  October 2024     $276,058.78            ↓
+ November 2024     $276,058.78            ↓
+ December 2024     $276,058.78            ↓
+  January 2025     $276,058.78            ↓
+
+Forecast Summary:
+Total Predicted Sales (6 months): $1,656,352.69
+Average Monthly Sales: $276,058.78
+6-Month Growth Rate: +0.00%
+
+==================================================
+SEASONAL ANALYSIS
+==================================================
+Strongest Month: Sep ($344,988.07)
+Weakest Month: Feb ($172,769.21)
+No description has been provided for this image
+Forecast results saved to 'amazon_sales_forecast_next_6_months.csv'
+ 
